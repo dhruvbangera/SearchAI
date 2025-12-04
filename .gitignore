@@ -1,0 +1,6 @@
+.env
+outputs/
+searchai_env/
+__pycache__/
+*.pyc
+.claude/
