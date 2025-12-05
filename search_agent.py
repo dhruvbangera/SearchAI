@@ -42,6 +42,8 @@ CLAUDE_MODEL_PREFERENCE = [
     if model.strip()
 ]
 
+USE_CLAUDE = os.getenv("ENABLE_CLAUDE", "false").strip().lower() in {"1", "true", "yes", "on"}
+
 
 class ClaudeModelNotFound(Exception):
     """Raised when a requested Claude model is unavailable."""
@@ -146,15 +148,41 @@ def call_openai_json(client: OpenAI, system_prompt: str, user_prompt: str, *, ex
     for attempt in range(3):
         try:
             has_responses = hasattr(client, "responses") and hasattr(client.responses, "create")
+            response_format = None
+            if has_responses and expect_array:
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "source_list",
+                        "schema": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                        },
+                        "strict": True,
+                    },
+                }
             if has_responses:
-                response = client.responses.create(
-                    model="gpt-5.1",
-                    input=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.1,
-                )
+                try:
+                    response = client.responses.create(
+                        model="gpt-5.1",
+                        input=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.1,
+                        response_format=response_format,
+                    )
+                except TypeError as err:
+                    if "response_format" not in str(err):
+                        raise
+                    response = client.responses.create(
+                        model="gpt-5.1",
+                        input=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.1,
+                    )
                 text = extract_openai_text(response)
             else:
                 messages = [
@@ -175,6 +203,10 @@ def call_openai_json(client: OpenAI, system_prompt: str, user_prompt: str, *, ex
             data = json.loads(cleaned_text)
             if expect_array and not isinstance(data, list):
                 raise ValueError("Expected JSON array from OpenAI response")
+            if expect_array and isinstance(data, list) and len(data) == 0:
+                print(f"⚠️  OpenAI returned empty array on attempt {attempt + 1}")
+                if attempt < 2:  # Allow retry
+                    raise ValueError("OpenAI returned empty results, retrying...")
             return data
         except json.JSONDecodeError as exc:
             preview = (last_raw_text or "")[:1000]
@@ -250,6 +282,8 @@ For each potential URL, ask:
 6. OUTPUT FORMAT
 Return a valid JSON array of objects. Nothing else.
 
+Output MUST be valid JSON. Do NOT include commentary, markdown, or prose.
+
 [
   {{
     "thinker": "{name}",
@@ -260,8 +294,6 @@ Return a valid JSON array of objects. Nothing else.
     "access_note": "open_access"
   }}
 ]
-
-If no new, valid sources are found, return an empty array: []
 
 Target Thinker: {name}
 Begin search.
@@ -353,7 +385,7 @@ Return a valid JSON array of objects. Nothing else.
   }}
 ]
 
-If no new, valid sources are found, return an empty array: []
+Output MUST be valid JSON. Do NOT include commentary, markdown, or prose.
 
 Target Thinker: {name}
 Existing URLs to Exclude: {existing_json}
@@ -640,7 +672,7 @@ def main():
     
     # Initialize clients
     openai_client = get_openai_client()
-    claude_client = get_claude_client()
+    claude_client = get_claude_client() if USE_CLAUDE else None
     
     prefilter_stats: Dict[str, int] = {}
 
@@ -658,13 +690,25 @@ def main():
     )
     prefilter_stats["openai"] = openai_prefilter_removed
     
-    # Step 2: Get Claude sources
+    # Step 2: Get Claude sources (optional)
     print("\n2. Passing info to Claude...")
-    try:
-        claude_results = get_claude_sources(claude_client, name, openai_results)
-    except RuntimeError as exc:
-        print(f"⚠️ Claude request failed ({exc}). Using OpenAI fallback for additional sources.")
-        claude_results = get_openai_additional_sources(openai_client, name, openai_results)
+    if USE_CLAUDE:
+        try:
+            claude_results = get_claude_sources(claude_client, name, openai_results)
+        except RuntimeError as exc:
+            print(
+                f"⚠️ Claude request failed ({exc}). Using OpenAI fallback for additional sources."
+            )
+            claude_results = get_openai_additional_sources(
+                openai_client, name, openai_results
+            )
+    else:
+        print(
+            "ℹ️ Claude integration disabled via ENABLE_CLAUDE. Using OpenAI fallback for additional sources."
+        )
+        claude_results = get_openai_additional_sources(
+            openai_client, name, openai_results
+        )
 
     # Save Claude results
     claude_file = output_dir / f"claude_{name}.json"
