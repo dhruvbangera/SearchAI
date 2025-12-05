@@ -116,12 +116,22 @@ def apply_prevalidation_filter(
 def extract_openai_text(response) -> str:
     """Extract concatenated text from a Responses API result."""
     texts: List[str] = []
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        texts.extend(output_text)
     for item in getattr(response, "output", []) or []:
         # Each item is typically a Message with a content list
         for content in getattr(item, "content", []) or []:
             if getattr(content, "type", None) == "text":
                 text = getattr(content, "text", "")
                 if text:
+                    texts.append(text)
+    if not texts and hasattr(response, "choices"):
+        for choice in getattr(response, "choices", []) or []:
+            message = getattr(choice, "message", None)
+            if message and isinstance(message, dict):
+                text = message.get("content")
+                if isinstance(text, str) and text:
                     texts.append(text)
     combined = "\n".join(texts).strip()
     if not combined:
@@ -132,6 +142,7 @@ def extract_openai_text(response) -> str:
 def call_openai_json(client: OpenAI, system_prompt: str, user_prompt: str, *, expect_array: bool = False) -> Any:
     """Call GPT-5.1 (Responses when available, chat completions otherwise) and parse JSON."""
     last_error: Exception | None = None
+    last_raw_text: str | None = None
     for attempt in range(3):
         try:
             has_responses = hasattr(client, "responses") and hasattr(client.responses, "create")
@@ -156,11 +167,21 @@ def call_openai_json(client: OpenAI, system_prompt: str, user_prompt: str, *, ex
                     temperature=0.1,
                 )
                 text = response.choices[0].message.content
-            data = json.loads(text)
+                if not text:
+                    raise ValueError("OpenAI chat completion returned empty content")
+            last_raw_text = text
+            # Clean up malformed text with extra newlines between characters
+            cleaned_text = text.replace('\n', '').strip()
+            data = json.loads(cleaned_text)
             if expect_array and not isinstance(data, list):
                 raise ValueError("Expected JSON array from OpenAI response")
             return data
-        except (json.JSONDecodeError, ValueError, RuntimeError) as exc:
+        except json.JSONDecodeError as exc:
+            preview = (last_raw_text or "")[:1000]
+            safe_preview = preview.encode("unicode_escape", errors="replace").decode()
+            print("\n[OpenAI JSON parse error] Raw response preview:\n" + safe_preview)
+            last_error = exc
+        except (ValueError, RuntimeError) as exc:
             last_error = exc
         except Exception as exc:  # pragma: no cover - defensive
             last_error = exc
