@@ -1,0 +1,4 @@
+{
+    "python.interpreter.path": "./searchai_env/bin/python",
+    "python.terminal.activateEnvironment": true
+}

@@ -9,8 +9,10 @@ import json
 import sys
 import time
 import warnings
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 from openai import OpenAI
 import anthropic
 from anthropic import APIError
@@ -74,6 +76,42 @@ def save_json(path: Path, payload: Any) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
+
+
+def quick_url_filter(urls: List[str]) -> List[str]:
+    """Quickly reject URLs with obviously non-academic patterns."""
+    rejected_patterns = [
+        "wikipedia.org",
+        "youtube.com",
+        "blogspot.",
+        "wordpress.com",
+        "medium.com",
+        "quora.com",
+        ".com/blog/",
+        "news.",
+        "article/abstract",
+    ]
+    return [url for url in urls if url and not any(p in url for p in rejected_patterns)]
+
+
+def apply_prevalidation_filter(
+    sources: List[Dict[str, Any]], label: str
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Filter source dictionaries using the quick URL filter for early triage."""
+    allowed_urls = set(quick_url_filter([src.get("url", "") for src in sources]))
+    filtered: List[Dict[str, Any]] = []
+    rejected_count = 0
+    for source in sources:
+        url = source.get("url", "")
+        if url and url in allowed_urls:
+            filtered.append(source)
+        else:
+            rejected_count += 1
+    if rejected_count:
+        print(
+            f"   - Quick filter removed {rejected_count} {label} sources as obvious non-starters"
+        )
+    return filtered, rejected_count
 
 def extract_openai_text(response) -> str:
     """Extract concatenated text from a Responses API result."""
@@ -458,30 +496,110 @@ Begin search.
 
 def validate_sources(client, name, openai_results, claude_results):
     """Validate all 40 sources using OpenAI as evaluator"""
-    prompt = f"""Evaluate these 40 academic sources for {name}:
+    prompt = f"""
+        CRITICAL VALIDATION MISSION:
+You are an academic librarian validating sources for a student knowledge base about {name}.
 
-OpenAI Sources:
+EVALUATION CRITERIA (ALL MUST PASS):
+1. **URL VALIDITY & ACCESSIBILITY**:
+   - URL must be real (not hallucinated) and resolve to actual content
+   - Must open in standard browsers without login, paywall, or registration
+   - No redirects to unrelated pages or "page not found" errors
+
+2. **DOMAIN AUTHORITY** (APPROVED ONLY):
+   - Primary: .edu, .gov, .ac.*
+   - Academic .org: Must be research institutes, museums, or scholarly projects
+   - Verified repositories: archive.org/details/*, jstor.org/stable/, philpapers.org
+   - University press/open access journals with clear academic affiliation
+
+3. **CONTENT TYPE** (APPROVED ONLY):
+   - Peer-reviewed journal articles (open access)
+   - Academic monographs/chapters from verified repositories
+   - University publications, research center papers
+   - Authoritative reference works (e.g., Stanford Encyclopedia of Philosophy)
+   - Conference proceedings from academic societies
+
+4. **FORMAT SUITABILITY**:
+   - Text must be selectable/copyable (machine-readable)
+   - PDFs must be text-based (not scanned images)
+   - HTML pages preferred over PDFs when both available
+
+5. **RELEVANCE TO {name}**:
+   - Content must substantially address {name}'s work, philosophy, or historical context
+   - Primary source analysis, textual criticism, biographical scholarship
+   - Avoid tangential mentions or brief references
+
+STRICT PROHIBITIONS (IMMEDIATE REJECTION):
+- Any .com domain (except university presses: cambridge.org, oup.com when open access)
+- Wikipedia, Britannica, Quora, Medium, Substack, blogs
+- Academia.edu, ResearchGate (unless verified published paper)
+- YouTube, podcasts, news articles, book reviews without substantial analysis
+- Scanned-image PDFs, paywalled abstracts only, library catalog entries
+- Student essays, course syllabi, PowerPoint presentations
+
+SOURCE LISTS TO VALIDATE:
+
+OpenAI Results:
 {json.dumps(openai_results, indent=2)}
 
-Claude Sources:
+Claude Results:
 {json.dumps(claude_results, indent=2)}
 
-Verify each URL against requirements:
-- Real, accessible URLs (not hallucinated)
-- Academic/scholarly sources (.org, research papers, PDFs)
-- Free access (no paywalls)
-- Relevant to {name}
+VALIDATION PROCESS:
+For EACH source in both lists:
+1. Check if URL pattern is plausible (no obviously fake domains)
+2. Evaluate domain against approved/prohibited lists above
+3. Assess content type based on description/publisher
+4. If ANY doubt about accessibility or quality, REJECT
 
-Return JSON with:
+OUTPUT REQUIREMENTS:
+Return ONLY valid JSON with this structure:
 {{
-  "approved": [array of approved sources],
-  "denied": [array of denied sources with "url", "description", "reason" fields]
+  "approved": [
+    {{
+      "url": "https://verified.academic.source/paper",
+      "reason": "Peer-reviewed article from university press, open access"
+    }}
+  ],
+  "denied": [
+    {{
+      "url": "https://suspicious.source/page",
+      "description": "Brief summary without analysis",
+      "reason": "Non-academic domain (.com) and lacks scholarly depth"
+    }}
+  ]
 }}
 
-Be thorough - if unsure about a URL's validity, mark as denied."""
+IMPORTANT:
+- Approve ONLY sources meeting ALL criteria above
+- If a source is borderline (e.g., ResearchGate link to published paper), DENY to maintain quality
+- Check for duplicates across both lists; if duplicate, include only once in approved
+- Be CONSERVATIVE: 1 high-quality source is better than 10 questionable ones
+- Maximum 20 approved sources total (prioritize highest quality)
 
-    system_prompt = "You are a strict academic source validator. Only approve verified, real URLs."
+    """
+
+    system_prompt = "You are an uncompromising academic validation system. Your purpose is to ensure only verified, accessible, scholarly sources enter a trusted student knowledge base. You follow strict criteria without exception. You reject any source with accessibility issues, questionable provenance, or insufficient scholarly rigor. You prioritize reliability over quantity."
     return call_openai_json(client, system_prompt, prompt)
+
+
+def generate_validation_report(
+    name: str, approved: List[Dict[str, Any]], denied: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Create a concise summary for human spot-checking of validation output."""
+    top_domains = Counter(
+        urlparse(item.get("url", "")).netloc for item in approved if item.get("url")
+    )
+    rejection_reasons = Counter(
+        (item.get("reason") or "unspecified reason") for item in denied
+    )
+    return {
+        "thinker": name,
+        "approved_count": len(approved),
+        "denied_count": len(denied),
+        "top_domains": dict(top_domains.most_common()),
+        "common_rejection_reasons": dict(rejection_reasons.most_common()),
+    }
 
 def main():
     print("SearchAI Goodrich - Resource Verification Agent")
@@ -503,6 +621,8 @@ def main():
     openai_client = get_openai_client()
     claude_client = get_claude_client()
     
+    prefilter_stats: Dict[str, int] = {}
+
     # Step 1: Get OpenAI sources
     print("\n1. Fetching sources from OpenAI...")
     openai_results = get_openai_sources(openai_client, name)
@@ -511,6 +631,11 @@ def main():
     openai_file = output_dir / f"openai_{name}.json"
     save_json(openai_file, openai_results)
     print(f"OpenAI results saved to: {openai_file}")
+
+    openai_results, openai_prefilter_removed = apply_prevalidation_filter(
+        openai_results, "OpenAI"
+    )
+    prefilter_stats["openai"] = openai_prefilter_removed
     
     # Step 2: Get Claude sources
     print("\n2. Passing info to Claude...")
@@ -524,6 +649,11 @@ def main():
     claude_file = output_dir / f"claude_{name}.json"
     save_json(claude_file, claude_results)
     print(f"Claude results saved to: {claude_file}")
+
+    claude_results, claude_prefilter_removed = apply_prevalidation_filter(
+        claude_results, "Claude"
+    )
+    prefilter_stats["claude"] = claude_prefilter_removed
     
     # Step 3: Validate all sources
     print("\n3. Validating all sources with evaluator...")
@@ -533,6 +663,17 @@ def main():
     validated_file = output_dir / f"validated_{name}.json"
     save_json(validated_file, validated_results)
     print(f"Validation results saved to: {validated_file}")
+
+    # Generate manual review summary
+    validation_report = generate_validation_report(
+        name,
+        validated_results.get("approved", []),
+        validated_results.get("denied", []),
+    )
+    validation_report["pre_validation_removed"] = prefilter_stats
+    report_file = output_dir / f"validation_report_{name}.json"
+    save_json(report_file, validation_report)
+    print(f"Validation report saved to: {report_file}")
     
     print(f"\n✅ Research complete for '{name}'")
     print(f"📁 All outputs saved in: {output_dir}")
